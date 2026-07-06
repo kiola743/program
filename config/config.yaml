@@ -31,6 +31,10 @@ strategies:
     bb_period: [20]
     bb_std: [2.0]
 
+walkforward:
+  train_days: 365  # 파라미터를 선택할 학습 구간 길이(일)
+  test_days: 90    # 그 파라미터를 평가만 하는 미래 구간 길이(일)
+
 # 실시간 매매 (paper / live 공용)
 live:
   # 실주문 이중 안전장치: 이 값이 true이고 CLI에 --live 플래그를 줘야만 실주문 발생

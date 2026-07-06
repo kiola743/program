@@ -1,9 +1,10 @@
-"""CLI 진입점: collect / backtest / compare / paper / live
+"""CLI 진입점: collect / backtest / compare / walkforward / paper / live
 
 사용 예:
     python -m quant.cli collect
     python -m quant.cli compare
-    python -m quant.cli backtest --strategy volatility_breakout --market KRW-BTC --k 0.5
+    python -m quant.cli walkforward
+    python -m quant.cli backtest --strategy volatility_breakout --market KRW-BTC --param k=0.5
     python -m quant.cli paper
     python -m quant.cli live --live   (config.live.live_enabled: true 도 필요)
 """
@@ -18,10 +19,12 @@ import sys
 import pandas as pd
 
 from quant.backtest.engine import buy_and_hold, run_backtest
+from quant.backtest.walkforward import run_walkforward, summarize_folds
 from quant.config import env, load_config
 from quant.data.collector import fetch_and_cache, load_cached
 from quant.exchange.paper import PaperExchange
 from quant.exchange.upbit import UpbitExchange
+from quant.live.statelog import StateLog
 from quant.live.trader import LiveTrader
 from quant.notify.discord import DiscordNotifier
 from quant.risk.manager import RiskManager
@@ -121,6 +124,52 @@ def cmd_compare(args, cfg: dict) -> None:
         print(ranked.head(5).to_string(index=False))
 
 
+def cmd_walkforward(args, cfg: dict) -> None:
+    wf_cfg = cfg.get("walkforward", {"train_days": 365, "test_days": 90})
+    bt = cfg["backtest"]
+    summary_rows = []
+    for market in cfg["markets"]:
+        df = load_cached(market, cfg["interval"], cfg["data"]["db_path"])
+        if df.empty:
+            logger.warning("%s 캐시 데이터 없음, 건너뜀 (collect 먼저 실행)", market)
+            continue
+
+        for strat_name, param_spec in cfg["strategies"].items():
+            strategy_cls = STRATEGY_REGISTRY[strat_name]
+            folds = run_walkforward(
+                df, strategy_cls, param_spec,
+                train_days=wf_cfg["train_days"], test_days=wf_cfg["test_days"],
+                initial_capital=bt["initial_capital"], fee_pct=bt["fee_pct"],
+                slippage_pct=bt["slippage_pct"],
+            )
+            summary = summarize_folds(folds)
+            if not summary:
+                logger.warning("%s %s 워크포워드 폴드가 없습니다 (데이터가 train+test 길이보다 짧음)",
+                              market, strat_name)
+                continue
+
+            print(f"\n=== {market} / {strat_name} 워크포워드 ({len(folds)}개 폴드) ===")
+            for f in folds:
+                print(f"  폴드{f.fold_idx}: train {f.train_start.date()}~{f.train_end.date()} "
+                      f"최적파라미터={f.best_params} (train샤프={f.train_sharpe:.2f}) | "
+                      f"test {f.test_start.date()}~{f.test_end.date()} "
+                      f"OOS수익률={f.test_metrics.total_return_pct:.2f}% "
+                      f"OOS샤프={f.test_metrics.sharpe:.2f}")
+            print(f"  요약: {summary}")
+            summary_rows.append({"마켓": market, "전략": strat_name, **summary})
+
+    if not summary_rows:
+        logger.error("워크포워드를 실행할 데이터가 없습니다. 먼저 `collect` 명령을 실행하세요.")
+        sys.exit(1)
+
+    print("\n=== 워크포워드 전체 요약 (OOS = Out-Of-Sample, 실제 검증 성과) ===")
+    print(pd.DataFrame(summary_rows).to_string(index=False))
+    print(
+        "\n주의: '수익 폴드 비율'이 낮거나 OOS 평균수익률이 compare 명령의 전체구간 "
+        "성과보다 크게 낮다면 해당 파라미터는 과최적화되었을 가능성이 높습니다."
+    )
+
+
 def cmd_paper(args, cfg: dict) -> None:
     live_cfg = cfg["live"]
     exchange = PaperExchange(cfg["paper"]["initial_cash"], db_path=cfg["data"]["db_path"])
@@ -128,11 +177,12 @@ def cmd_paper(args, cfg: dict) -> None:
     strategy = strategy_cls(**live_cfg["params"])
     risk = RiskManager(**cfg["risk"])
     notifier = DiscordNotifier(env("DISCORD_WEBHOOK_URL"))
+    state_log = StateLog(cfg["data"]["db_path"])
 
     trader = LiveTrader(
         exchange=exchange, strategy=strategy, markets=cfg["markets"], risk=risk,
         notifier=notifier, interval=cfg["interval"], lookback=live_cfg["lookback"],
-        poll_seconds=live_cfg["poll_seconds"],
+        poll_seconds=live_cfg["poll_seconds"], state_log=state_log,
     )
     trader.run(iterations=args.iterations)
 
@@ -157,11 +207,12 @@ def cmd_live(args, cfg: dict) -> None:
     strategy = strategy_cls(**live_cfg["params"])
     risk = RiskManager(**cfg["risk"])
     notifier = DiscordNotifier(env("DISCORD_WEBHOOK_URL"))
+    state_log = StateLog(cfg["data"]["db_path"])
 
     trader = LiveTrader(
         exchange=exchange, strategy=strategy, markets=cfg["markets"], risk=risk,
         notifier=notifier, interval=cfg["interval"], lookback=live_cfg["lookback"],
-        poll_seconds=live_cfg["poll_seconds"],
+        poll_seconds=live_cfg["poll_seconds"], state_log=state_log,
     )
     logger.warning("실계좌 자동매매를 시작합니다. 실제 자산이 매매됩니다.")
     trader.run(iterations=args.iterations)
@@ -181,6 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("compare", help="전략×코인×파라미터 조합 백테스트 비교")
 
+    sub.add_parser("walkforward", help="워크포워드 검증 (과최적화 여부 확인)")
+
     p_paper = sub.add_parser("paper", help="페이퍼 트레이딩 (가상 자금)")
     p_paper.add_argument("--iterations", type=int, default=None,
                         help="반복 횟수 제한 (테스트용, 기본은 무한루프)")
@@ -199,7 +252,7 @@ def main(argv: list[str] | None = None) -> None:
 
     commands = {
         "collect": cmd_collect, "backtest": cmd_backtest, "compare": cmd_compare,
-        "paper": cmd_paper, "live": cmd_live,
+        "walkforward": cmd_walkforward, "paper": cmd_paper, "live": cmd_live,
     }
     commands[args.command](args, cfg)
 

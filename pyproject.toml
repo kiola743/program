@@ -10,6 +10,7 @@ dependencies = [
     "PyYAML>=6.0",
     "python-dotenv>=1.0",
     "requests>=2.31",
+    "Flask>=3.0",
 ]
 
 [project.optional-dependencies]

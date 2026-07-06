@@ -17,9 +17,12 @@ src/quant/
   data/collector.py        OHLCV 수집 + SQLite 캐시
   strategy/                변동성 돌파, MA 모멘텀, 평균회귀(RSI+볼린저)
   backtest/                벡터화 백테스트 엔진 + 성과지표
+  backtest/walkforward.py  워크포워드 검증 (과최적화 여부 확인)
   risk/manager.py          포지션 사이징, 손절, 일일 손실 한도(kill switch)
   notify/discord.py        디스코드 웹훅 알림
   live/trader.py           실시간 매매 루프 (paper/live 공용)
+  live/statelog.py         체결/자산 스냅샷 공용 로그 (대시보드가 읽는 소스)
+  dashboard/app.py         실시간 모니터링 대시보드 (Flask)
   cli.py                   명령행 진입점
 tests/                     pytest 단위 테스트
 ```
@@ -74,7 +77,24 @@ python -m quant.cli compare
 python -m quant.cli backtest --strategy volatility_breakout --market KRW-BTC --param k=0.5
 ```
 
-### 3. 페이퍼 트레이딩 (가상 자금, 필수 검증 단계)
+### 3. 워크포워드 검증 (과최적화 확인 — compare 다음, paper 이전에 필수)
+
+```bash
+python -m quant.cli walkforward
+```
+
+`compare` 는 전체 과거 구간에서 가장 성과가 좋은 파라미터를 찾는데, 이는 과거
+데이터에 우연히 맞춰진(curve-fitting) 결과일 수 있습니다. 워크포워드는
+`config.yaml` 의 `walkforward.train_days`(기본 365일) 구간에서만 파라미터를
+고르고, 그 다음 `test_days`(기본 90일) — **파라미터 선택에 전혀 쓰이지 않은
+구간** — 에서의 성과(OOS, Out-Of-Sample)만 집계합니다. 이 창을 뒤로 밀며
+반복해 여러 폴드의 OOS 성과를 봅니다.
+
+출력의 "OOS 평균수익률"과 "수익 폴드 비율"을 확인하세요. `compare`의 전체구간
+성과보다 OOS 성과가 크게 낮거나, 수익 폴드 비율이 낮다면(예: 50% 미만) 그
+전략/파라미터는 과최적화되었을 가능성이 높으므로 실전 투입을 재고해야 합니다.
+
+### 4. 페이퍼 트레이딩 (가상 자금, 필수 검증 단계)
 
 ```bash
 python -m quant.cli paper
@@ -85,7 +105,18 @@ python -m quant.cli paper
 에 기록됩니다. **최소 2~4주 이상 운용해 실전 성과와 시그널 빈도를 확인한 뒤** 라이브로
 전환하는 것을 권장합니다.
 
-### 4. 실계좌 자동매매
+트레이더를 실행한 상태에서 별도 터미널에 아래를 실행하면 실시간 모니터링
+대시보드를 볼 수 있습니다:
+
+```bash
+python -m quant.dashboard.app --mode paper --port 5000
+# 브라우저에서 http://127.0.0.1:5000 접속 (15초마다 자동 새로고침)
+```
+
+현금/총자산/평가손익 요약, 자산 추이 그래프, 보유 포지션, 최근 체결 20건을
+보여줍니다. 실계좌 모드는 `--mode live` (마찬가지로 `.env`의 업비트 API 키 필요).
+
+### 5. 실계좌 자동매매
 
 이중 안전장치가 있어 아래 둘 다 충족해야 실주문이 나갑니다:
 
@@ -110,8 +141,8 @@ python -m quant.cli live --live
 pytest
 ```
 
-전략 시그널 로직, 백테스트 손익 계산, 리스크 매니저(kill switch 포함), 페이퍼
-거래소 체결 로직을 검증합니다.
+전략 시그널 로직, 백테스트 손익 계산, 워크포워드 검증, 리스크 매니저(kill switch
+포함), 페이퍼 거래소 체결 로직, 대시보드 렌더링을 검증합니다.
 
 ## 한국주식(KIS) 확장
 
@@ -124,7 +155,8 @@ Open API로 구현하면 동일한 전략을 국내주식에도 그대로 적용
 ## 알려진 한계
 
 - 백테스트는 일봉 종가 체결로 근사합니다(장중 슬리피지는 `slippage_pct` 로만 반영).
-- 과거 성과가 미래 수익을 보장하지 않습니다. 파라미터를 과거 데이터에 과최적화하지
-  않도록 주의하세요(워크포워드 검증 등은 이번 범위에 포함되지 않았습니다).
+- 과거 성과가 미래 수익을 보장하지 않습니다. `walkforward` 명령으로 과최적화 여부를
+  꼭 확인하세요 — 그래도 미래에 새로 등장하는 시장 상황(과거에 없던 패턴)까지
+  방어해주지는 못합니다.
 - 실행 환경은 로컬/직접 실행을 전제로 합니다. 24시간 무인 운영을 위해서는 별도의
   상시 구동 서버(예: 클라우드 VPS)와 프로세스 재시작 정책이 필요합니다.

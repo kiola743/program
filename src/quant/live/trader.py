@@ -11,6 +11,7 @@ import logging
 import time
 
 from quant.exchange.base import ExchangeAdapter
+from quant.live.statelog import StateLog
 from quant.notify.discord import DiscordNotifier
 from quant.risk.manager import RiskManager
 from quant.strategy.base import Signal, Strategy
@@ -29,6 +30,7 @@ class LiveTrader:
         interval: str = "day",
         lookback: int = 60,
         poll_seconds: int = 30,
+        state_log: StateLog | None = None,
     ):
         self.exchange = exchange
         self.strategy = strategy
@@ -38,6 +40,7 @@ class LiveTrader:
         self.interval = interval
         self.lookback = lookback
         self.poll_seconds = poll_seconds
+        self.state_log = state_log
 
     def _total_equity(self) -> float:
         equity = self.exchange.get_cash()
@@ -60,6 +63,8 @@ class LiveTrader:
         pos = self.exchange.get_position(market)
         result = self.exchange.sell_market(market, qty)
         self.notifier.trade(str(result))
+        if self.state_log:
+            self.state_log.record_trade(self.exchange.name, result)
         if pos:
             pnl = (result.price - pos.avg_price) * result.qty - result.fee
             self.risk.record_realized_pnl(pnl, self._total_equity())
@@ -74,9 +79,17 @@ class LiveTrader:
         amount = self.risk.max_order_krw(equity, cash)
         result = self.exchange.buy_market(market, amount)
         self.notifier.trade(str(result))
+        if self.state_log:
+            self.state_log.record_trade(self.exchange.name, result)
 
     def step(self) -> None:
         """한 주기 실행 (테스트 용이성을 위해 run()에서 분리)."""
+        if self.state_log:
+            try:
+                self.state_log.record_equity(self.exchange.name, self._total_equity(),
+                                             self.exchange.get_cash())
+            except Exception:
+                logger.exception("자산 스냅샷 기록 실패")
         for market in self.markets:
             try:
                 if not self.exchange.is_market_open():
