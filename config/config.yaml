@@ -1,0 +1,53 @@
+# ===== 퀀트 자동매매 설정 =====
+
+# 대상 마켓 (업비트 KRW 마켓 코드)
+markets:
+  - KRW-BTC
+  - KRW-ETH
+
+# 캔들 주기: day / minute60 / minute240 ...
+interval: day
+
+data:
+  db_path: data/quant.db
+  days: 730            # collect 시 수집할 일수
+
+backtest:
+  fee_pct: 0.0005      # 업비트 KRW 마켓 수수료 0.05%
+  slippage_pct: 0.0005 # 시장가 슬리피지 가정 0.05%
+  initial_capital: 1000000
+
+# 백테스트 파라미터 그리드 (compare 명령이 모든 조합을 돌림)
+strategies:
+  volatility_breakout:
+    k: [0.3, 0.4, 0.5, 0.6, 0.7]
+  ma_momentum:
+    fast: [5, 10]
+    slow: [20, 40]
+  mean_reversion:
+    rsi_period: [14]
+    rsi_buy: [30]
+    rsi_sell: [60, 70]
+    bb_period: [20]
+    bb_std: [2.0]
+
+# 실시간 매매 (paper / live 공용)
+live:
+  # 실주문 이중 안전장치: 이 값이 true이고 CLI에 --live 플래그를 줘야만 실주문 발생
+  live_enabled: false
+
+  strategy: volatility_breakout   # 실전 투입 전략 (compare 결과 보고 결정)
+  params:
+    k: 0.5
+
+  poll_seconds: 30       # 시세 확인 주기 (초)
+  lookback: 60           # 시그널 계산에 쓸 캔들 수
+
+risk:
+  max_alloc_pct: 0.30        # 코인 1개당 최대 자본 배분 비율
+  stop_loss_pct: 0.05        # 진입가 대비 -5% 도달 시 강제 손절
+  daily_loss_limit_pct: 0.03 # 하루 실현손실이 자본의 3% 도달 시 당일 거래 중단 (kill switch)
+  min_order_krw: 5000        # 업비트 최소 주문 금액
+
+paper:
+  initial_cash: 1000000  # 페이퍼 트레이딩 시작 가상 자본
