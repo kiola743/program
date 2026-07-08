@@ -49,16 +49,28 @@ def run_walkforward(
     initial_capital: float = 1_000_000,
     fee_pct: float = 0.0005,
     slippage_pct: float = 0.0005,
+    stop_loss_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
+    regime: pd.Series | None = None,
 ) -> list[Fold]:
     """train 구간에서 샤프비율 최대 파라미터를 고른 뒤 test 구간에서만 평가한다.
 
     (train_days + test_days)를 한 스텝(=test_days)씩 밀며 슬라이딩한다.
+    stop/trailing/regime 을 주면 라이브와 동일한 보호장치가 적용된 상태로 검증한다.
     """
     grid = _param_grid(param_spec)
     folds: list[Fold] = []
     n = len(df)
     start = 0
     fold_idx = 0
+
+    def _bt(window_df: pd.DataFrame, params: dict):
+        window_regime = regime.loc[window_df.index] if regime is not None else None
+        return run_backtest(
+            window_df, strategy_cls(**params), initial_capital, fee_pct, slippage_pct,
+            stop_loss_pct=stop_loss_pct, trailing_stop_pct=trailing_stop_pct,
+            regime=window_regime,
+        )
 
     while start + train_days + test_days <= n:
         train_df = df.iloc[start : start + train_days]
@@ -68,8 +80,7 @@ def run_walkforward(
         best_sharpe = float("-inf")
         for params in grid:
             try:
-                result = run_backtest(train_df, strategy_cls(**params),
-                                      initial_capital, fee_pct, slippage_pct)
+                result = _bt(train_df, params)
             except ValueError:
                 continue
             if result.metrics.sharpe > best_sharpe:
@@ -77,8 +88,7 @@ def run_walkforward(
                 best_params = params
 
         if best_params is not None:
-            test_result = run_backtest(test_df, strategy_cls(**best_params),
-                                       initial_capital, fee_pct, slippage_pct)
+            test_result = _bt(test_df, best_params)
             folds.append(Fold(
                 fold_idx=fold_idx,
                 train_start=train_df.index[0], train_end=train_df.index[-1],

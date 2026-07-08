@@ -1,0 +1,36 @@
+# 사용법:
+#   docker compose up -d --build          # paper 모드 트레이더 + 대시보드
+#   TRADE_MODE=live docker compose up -d  # 실계좌 (config live_enabled: true 필요)
+#   docker compose logs -f trader
+#
+# 컨테이너가 죽거나 서버가 재부팅돼도 restart 정책으로 자동 복구된다.
+# 상태(SQLite)와 로그는 호스트 볼륨에 남아 재시작 후에도 유지된다.
+
+services:
+  trader:
+    build: .
+    restart: unless-stopped
+    environment:
+      - TRADE_MODE=${TRADE_MODE:-paper}
+    command: >
+      sh -c 'if [ "$$TRADE_MODE" = "live" ];
+             then python -m quant.cli live --live;
+             else python -m quant.cli paper; fi'
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+      - ./config/config.yaml:/app/config/config.yaml:ro
+
+  dashboard:
+    build: .
+    restart: unless-stopped
+    command: python -m quant.dashboard.app --mode ${TRADE_MODE:-paper} --host 0.0.0.0 --port 5000
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+      - ./config/config.yaml:/app/config/config.yaml:ro
+    depends_on:
+      - trader

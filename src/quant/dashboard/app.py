@@ -261,13 +261,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None, help="config.yaml 경로")
     parser.add_argument("--mode", choices=["paper", "live"], default="paper")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="바인딩 주소 (Docker 등 컨테이너에서는 0.0.0.0)")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     app = create_app(cfg, args.mode)
-    print(f"대시보드 실행: http://127.0.0.1:{args.port} (모드={args.mode})")
-    app.run(host="127.0.0.1", port=args.port, debug=False)
+    print(f"대시보드 실행: http://{args.host}:{args.port} (모드={args.mode})")
+    app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":

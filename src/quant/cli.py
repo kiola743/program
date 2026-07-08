@@ -19,6 +19,7 @@ import sys
 import pandas as pd
 
 from quant.backtest.engine import buy_and_hold, run_backtest
+from quant.backtest.intraday import run_vb_intraday_backtest
 from quant.backtest.walkforward import run_walkforward, summarize_folds
 from quant.config import env, load_config
 from quant.data.collector import fetch_and_cache, load_cached
@@ -29,20 +30,47 @@ from quant.live.trader import LiveTrader
 from quant.notify.discord import DiscordNotifier
 from quant.risk.manager import RiskManager
 from quant.strategy import STRATEGY_REGISTRY
+from quant.strategy.regime import align_regime, regime_ok
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+def _setup_logging() -> None:
+    """콘솔 + 회전 파일(logs/quant.log, 5MB×5개) 동시 로깅."""
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    Path("logs").mkdir(exist_ok=True)
+    file_handler = RotatingFileHandler("logs/quant.log", maxBytes=5 * 1024 * 1024,
+                                       backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+
+_setup_logging()
 logger = logging.getLogger("quant.cli")
 
 
 def cmd_collect(args, cfg: dict) -> None:
+    data_cfg = cfg["data"]
+    jobs = [(cfg["interval"], data_cfg["days"])]
+    if getattr(args, "intraday", False):
+        jobs.append((data_cfg.get("intraday_interval", "minute15"),
+                     data_cfg.get("intraday_days", 180)))
+
     for market in cfg["markets"]:
-        logger.info("수집 시작: %s (%s, %d일)", market, cfg["interval"], cfg["data"]["days"])
-        df = fetch_and_cache(
-            market, interval=cfg["interval"], days=cfg["data"]["days"],
-            db_path=cfg["data"]["db_path"],
-        )
-        logger.info("%s 수집 완료: %d개 캔들 (%s ~ %s)", market, len(df),
-                    df.index.min() if len(df) else "-", df.index.max() if len(df) else "-")
+        for interval, days in jobs:
+            logger.info("수집 시작: %s (%s, %d일)", market, interval, days)
+            df = fetch_and_cache(
+                market, interval=interval, days=days, db_path=data_cfg["db_path"],
+            )
+            logger.info("%s(%s) 수집 완료: %d개 캔들 (%s ~ %s)", market, interval, len(df),
+                        df.index.min() if len(df) else "-", df.index.max() if len(df) else "-")
 
 
 def _param_grid(param_spec: dict) -> list[dict]:
@@ -60,11 +88,28 @@ def cmd_backtest(args, cfg: dict) -> None:
     strategy_cls = STRATEGY_REGISTRY[args.strategy]
     params = _parse_extra_params(args.param)
     strategy = strategy_cls(**params)
-
     bt = cfg["backtest"]
-    result = run_backtest(df, strategy, initial_capital=bt["initial_capital"],
-                          fee_pct=bt["fee_pct"], slippage_pct=bt["slippage_pct"])
-    print(f"\n=== {args.market} / {strategy.name} {params} ===")
+
+    if getattr(args, "intraday", False):
+        if args.strategy != "volatility_breakout":
+            logger.error("--intraday 는 volatility_breakout 전략에서만 지원됩니다 "
+                         "(장중 목표가 돌파 체결 재현이 목적)")
+            sys.exit(1)
+        intraday_interval = cfg["data"].get("intraday_interval", "minute15")
+        minute_df = load_cached(args.market, intraday_interval, cfg["data"]["db_path"])
+        if minute_df.empty:
+            logger.error("분봉 캐시가 없습니다. 먼저 `collect --intraday` 를 실행하세요.")
+            sys.exit(1)
+        result = run_vb_intraday_backtest(
+            df, minute_df, k=float(params.get("k", 0.5)),
+            initial_capital=bt["initial_capital"], fee_pct=bt["fee_pct"],
+            slippage_pct=bt["slippage_pct"],
+        )
+        print(f"\n=== {args.market} / volatility_breakout(분봉 정밀) {params} ===")
+    else:
+        result = run_backtest(df, strategy, initial_capital=bt["initial_capital"],
+                              fee_pct=bt["fee_pct"], slippage_pct=bt["slippage_pct"])
+        print(f"\n=== {args.market} / {strategy.name} {params} ===")
     for k, v in result.metrics.as_dict().items():
         print(f"  {k}: {v}")
 
@@ -80,14 +125,43 @@ def _parse_extra_params(param_list: list[str] | None) -> dict:
     return params
 
 
+def _protection_kwargs(cfg: dict) -> dict:
+    """라이브와 동일한 보호장치(손절/트레일링)를 백테스트에 적용하기 위한 인자."""
+    risk_cfg = cfg.get("risk", {})
+    return {
+        "stop_loss_pct": risk_cfg.get("stop_loss_pct"),
+        "trailing_stop_pct": risk_cfg.get("trailing_stop_pct"),
+    }
+
+
+def _load_regime(cfg: dict) -> "pd.Series | None":
+    """config.regime 이 켜져 있으면 기준 자산(BTC) 캐시로 레짐 시리즈를 만든다."""
+    regime_cfg = cfg.get("regime", {})
+    if not regime_cfg.get("enabled"):
+        return None
+    base_df = load_cached(regime_cfg.get("market", "KRW-BTC"), cfg["interval"],
+                          cfg["data"]["db_path"])
+    if base_df.empty:
+        logger.warning("레짐 기준 자산 데이터가 없어 레짐 필터를 건너뜁니다")
+        return None
+    return regime_ok(base_df, int(regime_cfg.get("ma_period", 200)))
+
+
 def cmd_compare(args, cfg: dict) -> None:
     bt = cfg["backtest"]
+    protection = _protection_kwargs(cfg)
+    base_regime = _load_regime(cfg)
+    if base_regime is not None or any(protection.values()):
+        print("(적용 중: 손절/트레일링 스탑"
+              + (", BTC 레짐 필터" if base_regime is not None else "") + ")")
+
     rows = []
     for market in cfg["markets"]:
         df = load_cached(market, cfg["interval"], cfg["data"]["db_path"])
         if df.empty:
             logger.warning("%s 캐시 데이터 없음, 건너뜀 (collect 먼저 실행)", market)
             continue
+        market_regime = align_regime(base_regime, df.index) if base_regime is not None else None
 
         bh_equity = buy_and_hold(df, bt["initial_capital"], bt["fee_pct"])
         bh_return = (bh_equity.iloc[-1] / bh_equity.iloc[0] - 1) * 100
@@ -103,7 +177,8 @@ def cmd_compare(args, cfg: dict) -> None:
                 strategy = strategy_cls(**params)
                 try:
                     result = run_backtest(df, strategy, initial_capital=bt["initial_capital"],
-                                          fee_pct=bt["fee_pct"], slippage_pct=bt["slippage_pct"])
+                                          fee_pct=bt["fee_pct"], slippage_pct=bt["slippage_pct"],
+                                          regime=market_regime, **protection)
                 except ValueError as e:
                     logger.warning("%s %s %s 백테스트 실패: %s", market, strat_name, params, e)
                     continue
@@ -127,12 +202,15 @@ def cmd_compare(args, cfg: dict) -> None:
 def cmd_walkforward(args, cfg: dict) -> None:
     wf_cfg = cfg.get("walkforward", {"train_days": 365, "test_days": 90})
     bt = cfg["backtest"]
+    protection = _protection_kwargs(cfg)
+    base_regime = _load_regime(cfg)
     summary_rows = []
     for market in cfg["markets"]:
         df = load_cached(market, cfg["interval"], cfg["data"]["db_path"])
         if df.empty:
             logger.warning("%s 캐시 데이터 없음, 건너뜀 (collect 먼저 실행)", market)
             continue
+        market_regime = align_regime(base_regime, df.index) if base_regime is not None else None
 
         for strat_name, param_spec in cfg["strategies"].items():
             strategy_cls = STRATEGY_REGISTRY[strat_name]
@@ -140,7 +218,7 @@ def cmd_walkforward(args, cfg: dict) -> None:
                 df, strategy_cls, param_spec,
                 train_days=wf_cfg["train_days"], test_days=wf_cfg["test_days"],
                 initial_capital=bt["initial_capital"], fee_pct=bt["fee_pct"],
-                slippage_pct=bt["slippage_pct"],
+                slippage_pct=bt["slippage_pct"], regime=market_regime, **protection,
             )
             summary = summarize_folds(folds)
             if not summary:
@@ -183,6 +261,7 @@ def cmd_paper(args, cfg: dict) -> None:
         exchange=exchange, strategy=strategy, markets=cfg["markets"], risk=risk,
         notifier=notifier, interval=cfg["interval"], lookback=live_cfg["lookback"],
         poll_seconds=live_cfg["poll_seconds"], state_log=state_log,
+        regime_cfg=cfg.get("regime"),
     )
     trader.run(iterations=args.iterations)
 
@@ -213,6 +292,7 @@ def cmd_live(args, cfg: dict) -> None:
         exchange=exchange, strategy=strategy, markets=cfg["markets"], risk=risk,
         notifier=notifier, interval=cfg["interval"], lookback=live_cfg["lookback"],
         poll_seconds=live_cfg["poll_seconds"], state_log=state_log,
+        regime_cfg=cfg.get("regime"),
     )
     logger.warning("실계좌 자동매매를 시작합니다. 실제 자산이 매매됩니다.")
     trader.run(iterations=args.iterations)
@@ -223,12 +303,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="config.yaml 경로")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("collect", help="OHLCV 데이터 수집")
+    p_collect = sub.add_parser("collect", help="OHLCV 데이터 수집")
+    p_collect.add_argument("--intraday", action="store_true",
+                           help="분봉도 함께 수집 (정밀 백테스트용)")
 
     p_bt = sub.add_parser("backtest", help="단일 전략 백테스트")
     p_bt.add_argument("--strategy", required=True, choices=list(STRATEGY_REGISTRY.keys()))
     p_bt.add_argument("--market", required=True)
     p_bt.add_argument("--param", action="append", help="key=value 형태, 여러 개 가능")
+    p_bt.add_argument("--intraday", action="store_true",
+                      help="분봉 기반 장중 체결 재현 (volatility_breakout 전용)")
 
     sub.add_parser("compare", help="전략×코인×파라미터 조합 백테스트 비교")
 

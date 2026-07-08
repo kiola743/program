@@ -10,20 +10,23 @@
 ## 구조
 
 ```
-config/config.yaml        전략 파라미터, 대상 코인, 리스크 한도
+config/config.yaml        전략 파라미터, 대상 코인, 리스크 한도, 레짐 필터
 config/.env.example        API 키/웹훅 템플릿 (복사해서 .env 로 사용)
 src/quant/
   exchange/                거래소 어댑터 (upbit, paper, kis_stub) — 공통 인터페이스
-  data/collector.py        OHLCV 수집 + SQLite 캐시
-  strategy/                변동성 돌파, MA 모멘텀, 평균회귀(RSI+볼린저)
-  backtest/                벡터화 백테스트 엔진 + 성과지표
+  data/collector.py        OHLCV 수집 + SQLite 캐시 (일봉+분봉)
+  strategy/                변동성 돌파, MA 모멘텀, 평균회귀, 돈치안 돌파, 절대 모멘텀
+  strategy/regime.py       BTC 장기 이평 기반 시장 레짐 필터
+  backtest/                벡터화 백테스트 엔진(손절/트레일링/레짐 반영) + 성과지표
   backtest/walkforward.py  워크포워드 검증 (과최적화 여부 확인)
-  risk/manager.py          포지션 사이징, 손절, 일일 손실 한도(kill switch)
+  backtest/intraday.py     분봉 기반 변동성 돌파 정밀 체결 재현
+  risk/manager.py          ATR 변동성 사이징, 손절/트레일링 스탑, kill switch
   notify/discord.py        디스코드 웹훅 알림
-  live/trader.py           실시간 매매 루프 (paper/live 공용)
+  live/trader.py           실시간 매매 루프 (paper/live 공용) + 일일 리포트
   live/statelog.py         체결/자산 스냅샷 공용 로그 (대시보드가 읽는 소스)
   dashboard/app.py         실시간 모니터링 대시보드 (Flask)
-  cli.py                   명령행 진입점
+  cli.py                   명령행 진입점 (logs/quant.log 회전 로그 포함)
+Dockerfile / docker-compose.yml   24시간 무인 운영용 컨테이너 구성
 tests/                     pytest 단위 테스트
 ```
 
@@ -54,11 +57,14 @@ cp config/.env.example .env   # 필요한 키 입력 (아래 참고)
 ### 1. 데이터 수집
 
 ```bash
-python -m quant.cli collect
+python -m quant.cli collect              # 일봉만
+python -m quant.cli collect --intraday   # 일봉 + 분봉 (정밀 백테스트용)
 ```
 
 `config.yaml` 의 `markets`(기본 KRW-BTC, KRW-ETH)에 대해 `data.days`(기본 730일)만큼
-일봉을 수집해 `data/quant.db` 에 캐시합니다.
+일봉을 수집해 `data/quant.db` 에 캐시합니다. `--intraday` 를 붙이면
+`data.intraday_interval`(기본 minute15) 분봉도 `intraday_days`(기본 180일)만큼
+수집합니다.
 
 ### 2. 전략 비교 (백테스트)
 
@@ -71,11 +77,26 @@ python -m quant.cli compare
 샤프비율 상위 조합이 하단에 별도로 요약됩니다. **이 결과를 보고 실전 투입 전략과
 파라미터를 `config.yaml` 의 `live.strategy` / `live.params` 에 반영하세요.**
 
+`config.yaml` 의 `regime.enabled: true`(기본값)이면 모든 백테스트에 BTC 200일선
+레짐 필터와 손절/트레일링 스탑이 함께 적용됩니다 — 라이브 트레이더와 같은
+조건에서 검증하기 위함입니다.
+
 단일 조합만 보려면:
 
 ```bash
 python -m quant.cli backtest --strategy volatility_breakout --market KRW-BTC --param k=0.5
 ```
+
+변동성 돌파는 분봉 기반 정밀 체결 재현도 지원합니다 (`collect --intraday` 선행):
+
+```bash
+python -m quant.cli backtest --strategy volatility_breakout --market KRW-BTC \
+    --param k=0.5 --intraday
+```
+
+일봉 근사는 "종가가 목표가 위였는가"만 보지만, `--intraday` 는 분봉을 스캔해
+**돌파가 발생한 순간의 체결가**(목표가 또는 갭 시가)를 재현하므로 변동성 돌파
+전략의 실제 기대 성과에 훨씬 가깝습니다.
 
 ### 3. 워크포워드 검증 (과최적화 확인 — compare 다음, paper 이전에 필수)
 
@@ -127,13 +148,32 @@ python -m quant.dashboard.app --mode paper --port 5000
 python -m quant.cli live --live
 ```
 
-### 리스크 관리 (config.yaml `risk` 섹션)
+### 리스크 관리 (config.yaml `risk` / `regime` 섹션)
 
 - `max_alloc_pct`: 코인 1개당 최대 자본 배분 비율
+- `vol_risk_budget_pct` + `atr_period`: **ATR 변동성 사이징** — 최근 변동성(ATR%)이
+  클수록 배분을 줄임. 배분 = min(max_alloc_pct, vol_risk_budget_pct / ATR%)
 - `stop_loss_pct`: 진입가 대비 손실률 도달 시 강제 손절
+- `trailing_stop_pct`: **트레일링 스탑** — 진입 후 최고가 대비 이 비율만큼 하락하면
+  청산 (이익 보호). 고점은 SQLite에 저장되어 재시작해도 유지
 - `daily_loss_limit_pct`: **하루 누적 실현손실이 이 비율을 넘으면 당일 신규 매수 중단**
   (kill switch) — 다음날 자동 해제
 - `min_order_krw`: 업비트 최소 주문 금액(5,000원) 미만이면 주문 스킵
+- `regime.enabled`: **레짐 필터** — BTC가 `ma_period`(기본 200일) 이평 아래면 신규
+  매수 금지. 약세장 진입을 구조적으로 차단하며 백테스트에도 동일 적용
+
+### 24시간 무인 운영 (Docker)
+
+```bash
+docker compose up -d --build              # paper 모드 트레이더 + 대시보드
+TRADE_MODE=live docker compose up -d      # 실계좌 (config live_enabled: true 필요)
+docker compose logs -f trader             # 로그 확인
+```
+
+`restart: unless-stopped` 정책으로 프로세스가 죽거나 서버가 재부팅돼도 자동
+복구됩니다. SQLite 상태와 로그(`logs/quant.log`, 5MB×5개 회전)는 호스트 볼륨에
+남아 재시작 후에도 유지됩니다. 매일 자정(로컬 기준) 전일 체결/자산 요약이
+디스코드로 전송됩니다.
 
 ## 테스트
 
@@ -158,5 +198,6 @@ Open API로 구현하면 동일한 전략을 국내주식에도 그대로 적용
 - 과거 성과가 미래 수익을 보장하지 않습니다. `walkforward` 명령으로 과최적화 여부를
   꼭 확인하세요 — 그래도 미래에 새로 등장하는 시장 상황(과거에 없던 패턴)까지
   방어해주지는 못합니다.
-- 실행 환경은 로컬/직접 실행을 전제로 합니다. 24시간 무인 운영을 위해서는 별도의
-  상시 구동 서버(예: 클라우드 VPS)와 프로세스 재시작 정책이 필요합니다.
+- 24시간 무인 운영은 Docker 구성(`docker compose up -d`)을 상시 구동 서버(예:
+  클라우드 VPS)에 올려서 하세요. 노트북/데스크톱은 절전·재부팅으로 매매가 끊길 수
+  있습니다.

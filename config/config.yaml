@@ -10,7 +10,9 @@ interval: day
 
 data:
   db_path: data/quant.db
-  days: 730            # collect 시 수집할 일수
+  days: 730                  # collect 시 수집할 일수
+  intraday_interval: minute15 # collect --intraday 시 분봉 주기
+  intraday_days: 180          # 분봉 수집 일수 (요청량 때문에 일봉보다 짧게)
 
 backtest:
   fee_pct: 0.0005      # 업비트 KRW 마켓 수수료 0.05%
@@ -30,6 +32,12 @@ strategies:
     rsi_sell: [60, 70]
     bb_period: [20]
     bb_std: [2.0]
+  donchian:
+    entry_n: [20, 55]
+    exit_n: [10, 20]
+  abs_momentum:
+    lookback: [60, 90, 120]
+    ma_filter: [50]
 
 walkforward:
   train_days: 365  # 파라미터를 선택할 학습 구간 길이(일)
@@ -50,8 +58,19 @@ live:
 risk:
   max_alloc_pct: 0.30        # 코인 1개당 최대 자본 배분 비율
   stop_loss_pct: 0.05        # 진입가 대비 -5% 도달 시 강제 손절
+  trailing_stop_pct: 0.08    # 진입 후 최고가 대비 -8% 하락 시 청산 (이익 보호)
   daily_loss_limit_pct: 0.03 # 하루 실현손실이 자본의 3% 도달 시 당일 거래 중단 (kill switch)
   min_order_krw: 5000        # 업비트 최소 주문 금액
+  # ATR 변동성 사이징: 배분 = min(max_alloc_pct, vol_risk_budget_pct / ATR%)
+  # 예: ATR%가 5%면 0.01/0.05 = 20%만 배분. 변동성이 작으면 max_alloc_pct까지.
+  vol_risk_budget_pct: 0.01
+  atr_period: 14
+
+# 레짐 필터: 기준 자산(BTC)이 장기 이평 아래면 신규 매수 금지 (백테스트·라이브 공용)
+regime:
+  enabled: true
+  market: KRW-BTC
+  ma_period: 200
 
 paper:
   initial_cash: 1000000  # 페이퍼 트레이딩 시작 가상 자본
